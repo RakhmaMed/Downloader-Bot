@@ -40,35 +40,96 @@ A Telegram bot built with [aiogram](https://docs.aiogram.dev/) and [yt-dlp](http
 
 3.  **Configuration:**
 
-    Create a `.env` file in the root directory (or rename `.env.example`):
+    Copy `env.example` to `.env` and set values:
 
     ```bash
-    cp .env.example .env
+    cp env.example .env
     ```
 
-    Open `.env` and add your Telegram Bot Token:
+    Required:
+    - `BOT_TOKEN` — Telegram bot token from @BotFather.
+    - `BOT_MODE` — `polling` (default) or `webhook`.
 
-    ```env
-    BOT_TOKEN=your_bot_token_here
-    ```
+    Webhook mode needs extra variables:
+    - `WEBHOOK_HOST` — public `https://your-domain` served by nginx with SSL.
+    - `WEBHOOK_PATH` — path proxied to the bot (e.g. `/telegram/webhook`).
+    - `WEBHOOK_PORT` / `WEBHOOK_LISTEN` — local bind for nginx upstream.
+    - `WEBHOOK_SECRET` — optional shared secret for Telegram.
 
 ## Usage
 
 1.  **Run the bot:**
 
-    Using `uv`:
+    Using the helper script (preferred):
 
     ```bash
-    uv run main.py
+    chmod +x manage.sh
+    ./manage.sh install        # one time dependency install
+    ./manage.sh run-polling    # foreground polling
     ```
 
-    Or with standard python:
+    Webhook (requires nginx proxy + HTTPS):
 
     ```bash
-    python main.py
+    BOT_MODE=webhook WEBHOOK_HOST=https://your-domain ./manage.sh run-webhook
+    ```
+
+    Background with logs:
+
+    ```bash
+    ./manage.sh deploy
+    # logs: logs/bot.log
+    ```
+
+    Or run directly with Python:
+
+    ```bash
+    uv run main.py   # reads BOT_MODE from .env
     ```
 
 2.  **Interact with the bot:**
     *   Start the bot with `/start`.
     *   Send a YouTube or Instagram link (e.g., `https://www.youtube.com/watch?v=...` or `https://www.instagram.com/reel/...`).
     *   The bot will download the video and send it to you.
+
+## Docker
+
+Build the image (runs dependency install via `uv` and bundles `ffmpeg`):
+
+```bash
+docker build -t downloader-bot .
+```
+
+Run the container, passing the bot token (either via `--env-file .env` or `-e BOT_TOKEN=...`):
+
+```bash
+docker run --rm \
+  --env-file .env \
+  downloader-bot
+```
+
+## Webhook behind nginx
+
+1. Set in `.env`:
+   - `BOT_MODE=webhook`
+   - `WEBHOOK_HOST=https://your-domain`
+   - `WEBHOOK_PATH=/telegram/webhook`
+   - `WEBHOOK_PORT=8081` (default)
+
+2. Example nginx location (TLS terminates in nginx):
+
+```
+location /telegram/webhook {
+    proxy_pass http://127.0.0.1:8081;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+3. Start the bot:
+
+```bash
+./manage.sh install
+./manage.sh deploy   # runs in background, uses BOT_MODE from .env
+```

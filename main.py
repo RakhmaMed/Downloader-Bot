@@ -1,11 +1,14 @@
-import os
-import logging
 import asyncio
+import logging
+import os
 import uuid
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types, F
+
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import FSInputFile
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from dotenv import load_dotenv
 import yt_dlp
 
 # Load environment variables
@@ -14,6 +17,15 @@ load_dotenv()
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Env config
+BOT_MODE = os.getenv("BOT_MODE", "polling").lower()
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook/bot")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8081"))
+WEBHOOK_LISTEN = os.getenv("WEBHOOK_LISTEN", "0.0.0.0")
+DOWNLOADS_DIR = "downloads"
 
 # Initialize Bot and Dispatcher
 token = os.getenv('BOT_TOKEN')
@@ -39,10 +51,10 @@ def download_media(url):
     """
     # Create a unique filename to avoid collisions
     random_id = str(uuid.uuid4())[:8]
-    filename_template = f"downloads/{random_id}_%(title)s.%(ext)s"
+    filename_template = f"{DOWNLOADS_DIR}/{random_id}_%(title)s.%(ext)s"
     
     # Ensure downloads directory exists
-    os.makedirs('downloads', exist_ok=True)
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
     ydl_opts = {
         'format': 'best[ext=mp4]/best',  # Prefer mp4
@@ -54,6 +66,67 @@ def download_media(url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         return ydl.prepare_filename(info)
+
+def build_webhook_url() -> str:
+    """
+    Build a full webhook URL combining the public host and path.
+    Raises if required settings are missing.
+    """
+    if not WEBHOOK_HOST:
+        raise RuntimeError("WEBHOOK_HOST is required when BOT_MODE=webhook")
+
+    host = WEBHOOK_HOST.rstrip("/")
+    path = "/" + WEBHOOK_PATH.lstrip("/")
+    return f"{host}{path}"
+
+async def run_webhook():
+    """
+    Run the bot in webhook mode behind an HTTP server (nginx handles TLS).
+    """
+    webhook_url = build_webhook_url()
+    secret = WEBHOOK_SECRET or None
+
+    # Configure aiohttp app
+    app = web.Application()
+    app["bot"] = bot
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=secret,
+    ).register(app, path="/" + WEBHOOK_PATH.lstrip("/"))
+
+    setup_application(app, dp, bot=bot)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        host=WEBHOOK_LISTEN,
+        port=WEBHOOK_PORT,
+    )
+
+    await site.start()
+
+    await bot.set_webhook(
+        url=webhook_url,
+        secret_token=secret,
+        drop_pending_updates=True,
+    )
+
+    logger.info("Webhook server started")
+    logger.info("Listening on http://%s:%s%s", WEBHOOK_LISTEN, WEBHOOK_PORT, WEBHOOK_PATH)
+    logger.info("Webhook URL set to %s", webhook_url)
+    if secret:
+        logger.info("Secret token enabled for webhook validation")
+
+    try:
+        await asyncio.Future()  # Run forever
+    finally:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await runner.cleanup()
+        logger.info("Webhook server stopped")
 
 @dp.message(F.text)
 async def handle_message(message: types.Message):
@@ -80,7 +153,7 @@ async def handle_message(message: types.Message):
         # Check file size (Telegram Bot API limit is ~50MB for sendVideo)
         file_size = os.path.getsize(file_path)
         if file_size > 50 * 1024 * 1024:
-             await status_msg.edit_text(f"File is too large ({file_size / (1024*1024):.1f} MB). Bot API limit is 50MB.")
+            await status_msg.edit_text(f"File is too large ({file_size / (1024*1024):.1f} MB). Bot API limit is 50MB.")
         else:
             video_file = FSInputFile(file_path)
             await message.answer_video(video_file)
@@ -105,8 +178,13 @@ async def handle_message(message: types.Message):
             os.remove(file_path)
 
 async def main():
-    print("Bot is running...")
-    await dp.start_polling(bot)
+    if BOT_MODE == "webhook":
+        await run_webhook()
+    else:
+        # Ensure webhook is disabled when running in polling mode
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Bot is running in polling mode...")
+        await dp.start_polling(bot)
 
 if __name__ == '__main__':
     asyncio.run(main())
